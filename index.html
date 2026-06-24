@@ -221,6 +221,10 @@
                         <option value="stock-asc">Stock Low-High</option>
                         <option value="stock-desc">Stock High-Low</option>
                     </select>
+                    <button class="btn btn-small btn-excel" onclick="window.app.downloadExcel('inventory')" title="Download as Excel">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                        Excel
+                    </button>
                 </div>
             </div>
             <div class="inventory-table-wrapper">
@@ -316,6 +320,10 @@
                         <option value="all">All Products</option>
                     </select>
                     <button class="btn btn-small btn-clear-filters" id="btn-clear-history-filters">Clear</button>
+                    <button class="btn btn-small btn-excel" onclick="window.app.downloadExcel('history')" title="Download as Excel">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                        Excel
+                    </button>
                 </div>
             </div>
             <div class="history-timeline" id="history-timeline">
@@ -489,6 +497,10 @@
                             <label for="retail-summary-date-filter">View Date</label>
                             <input type="date" id="retail-summary-date-filter" class="form-control filter-date">
                         </div>
+                        <button class="btn btn-small btn-excel" style="margin-bottom:16px;" onclick="window.app.downloadExcel('retailing')" title="Download retailing report as Excel">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                            Download Excel
+                        </button>
 
                         <!-- Summary Stats Cards -->
                         <div class="retail-summary-stats" id="retail-summary-stats">
@@ -583,7 +595,12 @@
                 </div>
 
                 <div class="dispatch-today-panel glass-panel">
-                    <h2>Recent Leakage / Breakage</h2>
+                    <h2>Recent Leakage / Breakage
+                        <button class="btn btn-small btn-excel" style="float:right;" onclick="window.app.downloadExcel('leakage')" title="Download as Excel">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                            Excel
+                        </button>
+                    </h2>
                     <div class="dispatch-today-list" id="leakage-recent-list">
                         <div class="empty-state">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2.69l5.66 5.66a8 8 0 11-11.31 0z"/></svg>

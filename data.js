@@ -398,3 +398,8 @@ const PRODUCT_CATALOG = [
     "initialStockPieces": 3
   }
 ];
+
+// Allow Node (server.js) to use the same catalog as the single source of truth.
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = PRODUCT_CATALOG;
+}

@@ -22,9 +22,44 @@
     // AUTH MANAGEMENT
     // ==========================================
     let currentUser = null; // { username, role, displayName }
+    let authToken = null;   // session token sent on every API call
 
     function isLoggedIn() {
         return currentUser !== null;
+    }
+
+    function getSessionToken() {
+        try { return sessionStorage.getItem('aashika_token'); } catch (e) { return null; }
+    }
+    function setSessionToken(token) {
+        try {
+            if (token) sessionStorage.setItem('aashika_token', token);
+            else sessionStorage.removeItem('aashika_token');
+        } catch (e) {}
+    }
+
+    // Central fetch wrapper that attaches the auth token and handles expiry
+    async function apiFetch(path, options = {}) {
+        const opts = { ...options, headers: { ...(options.headers || {}) } };
+        if (authToken) opts.headers['Authorization'] = 'Bearer ' + authToken;
+        const res = await fetch(path, opts);
+        if (res.status === 401 && isLoggedIn()) {
+            showToast('Session expired. Please log in again.', 'warning');
+            logout();
+        }
+        return res;
+    }
+
+    // Escape user-supplied text before inserting into HTML (prevents XSS)
+    function esc(str) {
+        return String(str == null ? '' : str)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+    // Safe JS string literal for use inside an HTML attribute (e.g. onclick="fn(...)").
+    // JSON.stringify quotes/escapes the value; esc() makes it attribute-safe.
+    function jsArg(str) {
+        return esc(JSON.stringify(String(str == null ? '' : str)));
     }
 
     function isAdmin() {
@@ -59,7 +94,9 @@
             const data = await res.json();
             if (data.success) {
                 currentUser = data.user;
+                authToken = data.token;
                 setSessionUser(currentUser);
+                setSessionToken(authToken);
                 return { success: true };
             } else {
                 return { success: false, error: data.error || 'Invalid credentials' };
@@ -71,7 +108,9 @@
 
     function logout() {
         currentUser = null;
+        authToken = null;
         setSessionUser(null);
+        setSessionToken(null);
         showLoginScreen();
     }
 
@@ -123,10 +162,12 @@
     }
 
     function getStockStatus(id) {
-        const s = getStock(id);
         const total = getTotalPieces(id);
+        const p = getProduct(id);
         if (total === 0) return 'out-of-stock';
-        if (s.cases < LOW_STOCK_THRESHOLD) return 'low-stock';
+        // Low stock = total remaining is below LOW_STOCK_THRESHOLD cases' worth
+        // (counts loose pieces too, not just full cases)
+        if (total < LOW_STOCK_THRESHOLD * p.piecesPerCase) return 'low-stock';
         return 'in-stock';
     }
 
@@ -155,8 +196,20 @@
         return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
     }
 
+    // Local calendar date (YYYY-MM-DD) in the user's timezone.
+    // IMPORTANT: timestamps are stored in UTC, so we must convert to LOCAL
+    // before comparing, otherwise "today" is wrong for several hours each day
+    // (Nepal is UTC+5:45).
+    function localDate(ts) {
+        const d = new Date(ts);
+        const y = d.getFullYear();
+        const m = String(d.getMonth() + 1).padStart(2, '0');
+        const day = String(d.getDate()).padStart(2, '0');
+        return `${y}-${m}-${day}`;
+    }
+
     function getToday() {
-        return new Date().toISOString().split('T')[0];
+        return localDate(new Date());
     }
 
     function generateId() {
@@ -166,29 +219,17 @@
     // ==========================================
     // PERSISTENCE (Server-side via API)
     // ==========================================
-    async function saveState() {
-        try {
-            // Save to server
-            await fetch('/api/state', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(state)
-            });
-        } catch (e) {
-            console.error('Failed to save state to server:', e);
-        }
-        // Also save to localStorage as a fallback
-        try {
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-        } catch (e) {}
-    }
-
+    // The SERVER is now the single source of truth for stock & transactions.
+    // The client never overwrites the whole database anymore — every change
+    // goes through a dedicated transaction endpoint, so concurrent users can't
+    // clobber each other's data. We just keep a local mirror for rendering.
     async function loadStateFromServer() {
         try {
-            const res = await fetch('/api/state');
+            const res = await apiFetch('/api/state');
+            if (!res.ok) return false;
             const data = await res.json();
             if (data && data.initialized) {
-                state = data;
+                state = { stock: data.stock || {}, dispatches: data.dispatches || [], initialized: true };
                 return true;
             }
         } catch (e) {
@@ -197,41 +238,58 @@
         return false;
     }
 
-    function loadStateFromLocal() {
-        try {
-            const saved = localStorage.getItem(STORAGE_KEY);
-            if (saved) {
-                const parsed = JSON.parse(saved);
-                if (parsed.initialized) {
-                    state = parsed;
-                    return true;
-                }
-            }
-        } catch (e) {
-            console.error('Failed to load state from localStorage:', e);
+    async function initializeState() {
+        const ok = await loadStateFromServer();
+        if (!ok) {
+            showToast('Could not load data from the server.', 'error');
+            state = { stock: {}, dispatches: [], initialized: false };
         }
-        return false;
     }
 
-    async function initializeState() {
-        // Try server first, then localStorage fallback
-        const serverLoaded = await loadStateFromServer();
-        if (!serverLoaded) {
-            const localLoaded = loadStateFromLocal();
-            if (!localLoaded) {
-                // First run - initialize with catalog defaults
-                state.stock = {};
-                PRODUCT_CATALOG.forEach(p => {
-                    state.stock[p.id] = {
-                        cases: p.initialStockCases,
-                        pieces: p.initialStockPieces
-                    };
-                });
-                state.dispatches = [];
-                state.initialized = true;
+    // Record any stock movement through the server (server validates & updates stock).
+    // Returns true on success. type is one of:
+    // dispatch | restock | retail-takeout | retail-return | leakage | breakage
+    async function recordTransaction({ type, productId, cases, pieces, notes }) {
+        try {
+            const res = await apiFetch('/api/transactions', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ type, productId, cases, pieces, notes })
+            });
+            const data = await res.json();
+            if (!data.success) {
+                showToast(data.error || 'Action failed', 'error');
+                return false;
             }
-            // Save to server for sync
-            await saveState();
+            // Update local mirror from the authoritative server response
+            state.stock[productId] = data.stock;
+            state.dispatches.push(data.transaction);
+            return true;
+        } catch (e) {
+            showToast('Server error. Please try again.', 'error');
+            return false;
+        }
+    }
+
+    // Undo / delete a transaction (reverses its stock effect on the server).
+    async function undoTransaction(id) {
+        const confirmed = await showConfirm('Undo this transaction?', 'This reverses its effect on stock and removes it from the records. This cannot be undone.');
+        if (!confirmed) return;
+        try {
+            const res = await apiFetch('/api/transactions', {
+                method: 'DELETE',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id })
+            });
+            const data = await res.json();
+            if (!data.success) { showToast(data.error || 'Failed to undo', 'error'); return; }
+            // Re-sync local mirror from server
+            await loadStateFromServer();
+            showToast('Transaction undone', 'info');
+            renderCurrentView();
+            renderStats();
+        } catch (e) {
+            showToast('Server error. Please try again.', 'error');
         }
     }
 
@@ -353,11 +411,11 @@
 
         const today = getToday();
         const todayDispatches = state.dispatches.filter(d =>
-            d.type === 'dispatch' && d.timestamp.startsWith(today)
+            d.type === 'dispatch' && localDate(d.timestamp) === today
         ).length;
 
         const leakageBreakageCount = state.dispatches.filter(d =>
-            (d.type === 'leakage' || d.type === 'breakage') && d.timestamp.startsWith(today)
+            (d.type === 'leakage' || d.type === 'breakage') && localDate(d.timestamp) === today
         ).length;
 
         animateCounter('stat-total-products', totalProducts);
@@ -497,7 +555,7 @@
         document.getElementById('today-dispatch-date').textContent = formatDate(new Date().toISOString());
 
         const todayDispatches = state.dispatches
-            .filter(d => d.type === 'dispatch' && d.timestamp.startsWith(today))
+            .filter(d => d.type === 'dispatch' && localDate(d.timestamp) === today)
             .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
         const list = document.getElementById('dispatch-today-list');
@@ -523,7 +581,7 @@
             const qtyText = [];
             if (d.cases > 0) qtyText.push(`${d.cases}c`);
             if (d.pieces > 0) qtyText.push(`${d.pieces}p`);
-            const userTag = d.user ? ` · by ${d.user}` : '';
+            const userTag = d.user ? ` · by ${esc(d.user)}` : '';
             return `
                 <div class="dispatch-entry">
                     <div class="dispatch-entry-img">
@@ -531,7 +589,7 @@
                     </div>
                     <div class="dispatch-entry-info">
                         <div class="dispatch-entry-name">${p.name} ${p.volume}</div>
-                        <div class="dispatch-entry-detail">${d.notes || 'No notes'}${userTag}</div>
+                        <div class="dispatch-entry-detail">${esc(d.notes) || 'No notes'}${userTag}</div>
                     </div>
                     <span class="dispatch-entry-qty">${qtyText.join(' ')}</span>
                     <span class="dispatch-entry-time">${formatTime(d.timestamp)}</span>
@@ -554,7 +612,7 @@
         let filtered = [...state.dispatches].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
         if (dateFilter) {
-            filtered = filtered.filter(d => d.timestamp.startsWith(dateFilter));
+            filtered = filtered.filter(d => localDate(d.timestamp) === dateFilter);
         }
 
         if (productFilter && productFilter !== 'all') {
@@ -575,7 +633,7 @@
         // Group by date
         const groups = {};
         filtered.forEach(d => {
-            const date = d.timestamp.split('T')[0];
+            const date = localDate(d.timestamp);
             if (!groups[date]) groups[date] = [];
             groups[date].push(d);
         });
@@ -602,16 +660,25 @@
                     ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>'
                     : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>';
 
-                const userTag = d.user ? ` · by ${d.user}` : '';
+                const userTag = d.user ? ` · by ${esc(d.user)}` : '';
+
+                // Show an undo button to admins (any txn) or the user who made it
+                const canUndo = isAdmin() || (currentUser && d.user === currentUser.username);
+                const undoBtn = canUndo
+                    ? `<button class="btn-undo-txn" title="Undo this transaction" onclick="window.app.undoTransaction(${jsArg(d.id)})">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 102.13-9.36L1 10"/></svg>
+                       </button>`
+                    : '';
 
                 return `
                     <div class="history-entry">
                         <div class="history-entry-icon ${iconClass}">${iconSvg}</div>
                         <div class="history-entry-info">
                             <div class="history-entry-title">${p.name} ${p.volume}</div>
-                            <div class="history-entry-meta">${formatTime(d.timestamp)}${d.notes ? ' · ' + d.notes : ''}${userTag}${isLeakage ? ' <span class="leakage-type-tag tag-' + d.type + '">' + d.type + '</span>' : ''}</div>
+                            <div class="history-entry-meta">${formatTime(d.timestamp)}${d.notes ? ' · ' + esc(d.notes) : ''}${userTag}${isLeakage ? ' <span class="leakage-type-tag tag-' + d.type + '">' + d.type + '</span>' : ''}</div>
                         </div>
                         <span class="history-entry-qty ${qtyClass}">${prefix} ${qtyParts.join(', ')}</span>
+                        ${undoBtn}
                     </div>`;
             }).join('');
 
@@ -656,7 +723,7 @@
             const qtyParts = [];
             if (d.cases > 0) qtyParts.push(`${d.cases}c`);
             if (d.pieces > 0) qtyParts.push(`${d.pieces}p`);
-            const userTag = d.user ? ` · by ${d.user}` : '';
+            const userTag = d.user ? ` · by ${esc(d.user)}` : '';
             return `
                 <div class="dispatch-entry">
                     <div class="dispatch-entry-img">
@@ -664,7 +731,7 @@
                     </div>
                     <div class="dispatch-entry-info">
                         <div class="dispatch-entry-name">${p.name} ${p.volume}</div>
-                        <div class="dispatch-entry-detail">${d.notes || 'No notes'} · ${formatDate(d.timestamp)}${userTag}</div>
+                        <div class="dispatch-entry-detail">${esc(d.notes) || 'No notes'} · ${formatDate(d.timestamp)}${userTag}</div>
                     </div>
                     <span class="dispatch-entry-qty restock-qty">+${qtyParts.join(' ')}</span>
                     <span class="dispatch-entry-time">${formatTime(d.timestamp)}</span>
@@ -710,7 +777,7 @@
             if (d.cases > 0) qtyParts.push(`${d.cases}c`);
             if (d.pieces > 0) qtyParts.push(`${d.pieces}p`);
             const typeTag = `<span class="leakage-type-tag tag-${d.type}">${d.type}</span>`;
-            const userTag = d.user ? ` · by ${d.user}` : '';
+            const userTag = d.user ? ` · by ${esc(d.user)}` : '';
             return `
                 <div class="dispatch-entry">
                     <div class="dispatch-entry-img">
@@ -718,7 +785,7 @@
                     </div>
                     <div class="dispatch-entry-info">
                         <div class="dispatch-entry-name">${p.name} ${p.volume} ${typeTag}</div>
-                        <div class="dispatch-entry-detail">${d.notes || 'No notes'} · ${formatDate(d.timestamp)}${userTag}</div>
+                        <div class="dispatch-entry-detail">${esc(d.notes) || 'No notes'} · ${formatDate(d.timestamp)}${userTag}</div>
                     </div>
                     <span class="dispatch-entry-qty leakage-qty">−${qtyParts.join(' ')}</span>
                     <span class="dispatch-entry-time">${formatTime(d.timestamp)}</span>
@@ -751,8 +818,8 @@
         const selectedDate = document.getElementById('retail-summary-date-filter').value || getToday();
 
         // Get all retail-takeout and retail-return for this date
-        const takeouts = state.dispatches.filter(d => d.type === 'retail-takeout' && d.timestamp.startsWith(selectedDate));
-        const returns = state.dispatches.filter(d => d.type === 'retail-return' && d.timestamp.startsWith(selectedDate));
+        const takeouts = state.dispatches.filter(d => d.type === 'retail-takeout' && localDate(d.timestamp) === selectedDate);
+        const returns = state.dispatches.filter(d => d.type === 'retail-return' && localDate(d.timestamp) === selectedDate);
 
         let totalTaken = 0;
         let totalReturned = 0;
@@ -862,7 +929,7 @@
             const typeTag = isTakeout
                 ? '<span class="retail-type-tag tag-takeout">TAKEN</span>'
                 : '<span class="retail-type-tag tag-return">RETURNED</span>';
-            const userTag = d.user ? ` · by ${d.user}` : '';
+            const userTag = d.user ? ` · by ${esc(d.user)}` : '';
             return `
                 <div class="dispatch-entry">
                     <div class="dispatch-entry-img">
@@ -870,7 +937,7 @@
                     </div>
                     <div class="dispatch-entry-info">
                         <div class="dispatch-entry-name">${p.name} ${p.volume} ${typeTag}</div>
-                        <div class="dispatch-entry-detail">${d.notes || 'No notes'} · ${formatDate(d.timestamp)}${userTag}</div>
+                        <div class="dispatch-entry-detail">${esc(d.notes) || 'No notes'} · ${formatDate(d.timestamp)}${userTag}</div>
                     </div>
                     <span class="dispatch-entry-qty ${qtyClass}">${prefix}${qtyParts.join(' ')}</span>
                     <span class="dispatch-entry-time">${formatTime(d.timestamp)}</span>
@@ -889,7 +956,7 @@
         // Fetch users list
         let users = [];
         try {
-            const res = await fetch('/api/users');
+            const res = await apiFetch('/api/users');
             users = await res.json();
         } catch (e) {
             users = [];
@@ -898,7 +965,7 @@
         // Stats
         document.getElementById('admin-stat-users').textContent = users.length;
         document.getElementById('admin-stat-total-txns').textContent = state.dispatches.length;
-        document.getElementById('admin-stat-today-txns').textContent = state.dispatches.filter(d => d.timestamp.startsWith(today)).length;
+        document.getElementById('admin-stat-today-txns').textContent = state.dispatches.filter(d => localDate(d.timestamp) === today).length;
 
         // User Activity Grid
         const userGrid = document.getElementById('admin-user-grid');
@@ -917,10 +984,10 @@
             const avatarClass = u.role === 'admin' ? 'role-admin' : '';
             return `
                 <div class="admin-user-card">
-                    <div class="admin-user-card-avatar ${avatarClass}">${u.displayName.charAt(0)}</div>
+                    <div class="admin-user-card-avatar ${avatarClass}">${esc(u.displayName.charAt(0))}</div>
                     <div class="admin-user-card-info">
-                        <div class="admin-user-card-name">${u.displayName}</div>
-                        <div class="admin-user-card-role">${u.role}</div>
+                        <div class="admin-user-card-name">${esc(u.displayName)}</div>
+                        <div class="admin-user-card-role">${esc(u.role)}</div>
                     </div>
                     <div style="text-align:right;">
                         <div class="admin-user-card-count">${count}</div>
@@ -933,7 +1000,7 @@
         const userFilter = document.getElementById('admin-filter-user');
         const currentFilterVal = userFilter.value;
         userFilter.innerHTML = '<option value="all">All Users</option>' + users.map(u =>
-            `<option value="${u.username}">${u.displayName}</option>`
+            `<option value="${esc(u.username)}">${esc(u.displayName)}</option>`
         ).join('');
         userFilter.value = currentFilterVal || 'all';
 
@@ -960,7 +1027,7 @@
         }
 
         if (dateFilter) {
-            filtered = filtered.filter(d => d.timestamp.startsWith(dateFilter));
+            filtered = filtered.filter(d => localDate(d.timestamp) === dateFilter);
         }
 
         // Limit to 100 entries
@@ -998,11 +1065,11 @@
                     <div class="admin-log-user-badge ${badgeClass}">${initial}</div>
                     <div class="admin-log-info">
                         <div class="admin-log-title">
-                            <span class="log-username">${username}</span>
+                            <span class="log-username">${esc(username)}</span>
                             <span class="log-action-tag ${tagClass}">${actionLabel}</span>
                             ${p.name} ${p.volume}
                         </div>
-                        <div class="admin-log-meta">${d.notes || '—'} · ${formatDate(d.timestamp)}</div>
+                        <div class="admin-log-meta">${esc(d.notes) || '—'} · ${formatDate(d.timestamp)}</div>
                     </div>
                     <span class="admin-log-qty" style="color:${qtyColor}">${prefix}${qtyParts.join(' ')}</span>
                     <span class="admin-log-time">${formatTime(d.timestamp)}</span>
@@ -1028,18 +1095,18 @@
             const isSelf = currentUser && currentUser.username === u.username;
             const removeDisabled = isSelf ? 'disabled title="Cannot remove yourself"' : '';
             return `
-                <div class="admin-user-row" id="user-row-${u.username}">
-                    <div class="admin-user-row-avatar ${avatarClass}">${u.displayName.charAt(0)}</div>
+                <div class="admin-user-row" id="user-row-${esc(u.username)}">
+                    <div class="admin-user-row-avatar ${avatarClass}">${esc(u.displayName.charAt(0))}</div>
                     <div class="admin-user-row-info">
-                        <div class="admin-user-row-name">${u.displayName}</div>
+                        <div class="admin-user-row-name">${esc(u.displayName)}</div>
                         <div class="admin-user-row-meta">
-                            <span class="admin-user-row-username">@${u.username}</span>
-                            <span class="admin-user-role-badge ${roleBadgeClass}">${u.role}</span>
+                            <span class="admin-user-row-username">@${esc(u.username)}</span>
+                            <span class="admin-user-role-badge ${roleBadgeClass}">${esc(u.role)}</span>
                         </div>
                     </div>
                     <div class="admin-user-row-actions">
                         <button class="btn-user-action btn-user-change-pw"
-                            onclick="window.app.openChangePwDialog('${u.username}', '${u.displayName}')"
+                            onclick="window.app.openChangePwDialog(${jsArg(u.username)}, ${jsArg(u.displayName)})"
                             title="Change password">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
@@ -1047,7 +1114,7 @@
                             </svg>
                         </button>
                         <button class="btn-user-action btn-user-remove" ${removeDisabled}
-                            onclick="window.app.removeUser('${u.username}', '${u.displayName}')"
+                            onclick="window.app.removeUser(${jsArg(u.username)}, ${jsArg(u.displayName)})"
                             title="Remove user">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <polyline points="3 6 5 6 21 6"/>
@@ -1070,7 +1137,7 @@
 
     async function addUser(username, displayName, password, role) {
         try {
-            const res = await fetch('/api/users/add', {
+            const res = await apiFetch('/api/users/add', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ username, displayName, password, role })
@@ -1101,7 +1168,7 @@
         if (!confirmed) return;
 
         try {
-            const res = await fetch('/api/users/remove', {
+            const res = await apiFetch('/api/users/remove', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ username })
@@ -1120,7 +1187,7 @@
 
     async function changeUserPassword(username, newPassword) {
         try {
-            const res = await fetch('/api/users/change-password', {
+            const res = await apiFetch('/api/users/change-password', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ username, newPassword })
@@ -1141,199 +1208,61 @@
     // ==========================================
     // ACTIONS: DISPATCH & RESTOCK
     // ==========================================
-    function performDispatch(productId, cases, pieces, notes) {
-        const product = getProduct(productId);
-        const stock = getStock(productId);
-        const requestedPieces = (cases * product.piecesPerCase) + pieces;
-        const availablePieces = getTotalPieces(productId);
-
-        if (requestedPieces <= 0) {
-            showToast('Please enter a valid quantity', 'warning');
-            return false;
-        }
-
-        if (requestedPieces > availablePieces) {
-            showToast(`Insufficient stock! Available: ${stock.cases} cases, ${stock.pieces} pieces`, 'error');
-            return false;
-        }
-
-        // Deduct stock
-        let remaining = availablePieces - requestedPieces;
-        const newCases = Math.floor(remaining / product.piecesPerCase);
-        const newPieces = remaining % product.piecesPerCase;
-
-        state.stock[productId] = { cases: newCases, pieces: newPieces };
-
-        // Log transaction
-        state.dispatches.push({
-            id: generateId(),
-            productId,
-            cases,
-            pieces,
-            totalPieces: requestedPieces,
-            notes: notes || '',
-            timestamp: new Date().toISOString(),
-            type: 'dispatch',
-            user: currentUser ? currentUser.username : 'unknown'
-        });
-
-        saveState();
-        showToast(`Dispatched ${cases}c ${pieces}p of ${product.name} ${product.volume}`, 'success');
+    // These now validate client-side for fast feedback, then let the SERVER
+    // perform the authoritative stock change via recordTransaction().
+    function validateQty(cases, pieces) {
+        if (cases < 0 || pieces < 0) { showToast('Quantities cannot be negative', 'warning'); return false; }
+        if ((cases * 1) + (pieces * 1) <= 0 && !(cases > 0 || pieces > 0)) { showToast('Please enter a valid quantity', 'warning'); return false; }
         return true;
     }
 
-    function performRestock(productId, cases, pieces, notes) {
+    async function performDispatch(productId, cases, pieces, notes) {
         const product = getProduct(productId);
-
-        if (cases <= 0 && pieces <= 0) {
-            showToast('Please enter a valid quantity', 'warning');
-            return false;
-        }
-
-        // Add stock
-        const stock = getStock(productId);
-        let totalPieces = (stock.cases * product.piecesPerCase) + stock.pieces + (cases * product.piecesPerCase) + pieces;
-        const newCases = Math.floor(totalPieces / product.piecesPerCase);
-        const newPcs = totalPieces % product.piecesPerCase;
-
-        state.stock[productId] = { cases: newCases, pieces: newPcs };
-
-        // Log transaction
-        state.dispatches.push({
-            id: generateId(),
-            productId,
-            cases,
-            pieces,
-            totalPieces: (cases * product.piecesPerCase) + pieces,
-            notes: notes || '',
-            timestamp: new Date().toISOString(),
-            type: 'restock',
-            user: currentUser ? currentUser.username : 'unknown'
-        });
-
-        saveState();
-        showToast(`Restocked ${cases}c ${pieces}p of ${product.name} ${product.volume}`, 'success');
-        return true;
+        if (!validateQty(cases, pieces)) return false;
+        if ((cases * product.piecesPerCase + pieces) <= 0) { showToast('Please enter a valid quantity', 'warning'); return false; }
+        const ok = await recordTransaction({ type: 'dispatch', productId, cases, pieces, notes: notes || '' });
+        if (ok) showToast(`Dispatched ${cases}c ${pieces}p of ${product.name} ${product.volume}`, 'success');
+        return ok;
     }
 
-    function performLeakage(productId, cases, pieces, type, party, notes) {
+    async function performRestock(productId, cases, pieces, notes) {
         const product = getProduct(productId);
-        const stock = getStock(productId);
-        const requestedPieces = (cases * product.piecesPerCase) + pieces;
-        const availablePieces = getTotalPieces(productId);
+        if (!validateQty(cases, pieces)) return false;
+        if (cases <= 0 && pieces <= 0) { showToast('Please enter a valid quantity', 'warning'); return false; }
+        const ok = await recordTransaction({ type: 'restock', productId, cases, pieces, notes: notes || '' });
+        if (ok) showToast(`Restocked ${cases}c ${pieces}p of ${product.name} ${product.volume}`, 'success');
+        return ok;
+    }
 
-        if (requestedPieces <= 0) {
-            showToast('Please enter a valid quantity', 'warning');
-            return false;
-        }
-
-        if (requestedPieces > availablePieces) {
-            showToast(`Insufficient stock to replace! Available: ${stock.cases} cases, ${stock.pieces} pieces`, 'error');
-            return false;
-        }
-
-        // Deduct stock (fresh product given as replacement)
-        let remaining = availablePieces - requestedPieces;
-        const newCases = Math.floor(remaining / product.piecesPerCase);
-        const newPieces = remaining % product.piecesPerCase;
-
-        state.stock[productId] = { cases: newCases, pieces: newPieces };
-
-        // Build combined note with party info
+    async function performLeakage(productId, cases, pieces, type, party, notes) {
+        const product = getProduct(productId);
+        if (!validateQty(cases, pieces)) return false;
+        if ((cases * product.piecesPerCase + pieces) <= 0) { showToast('Please enter a valid quantity', 'warning'); return false; }
         const fullNote = party + (notes ? ' — ' + notes : '');
-
-        // Log transaction
-        state.dispatches.push({
-            id: generateId(),
-            productId,
-            cases,
-            pieces,
-            totalPieces: requestedPieces,
-            notes: fullNote,
-            timestamp: new Date().toISOString(),
-            type: type, // 'leakage' or 'breakage'
-            user: currentUser ? currentUser.username : 'unknown'
-        });
-
-        saveState();
-        const typeLabel = type.charAt(0).toUpperCase() + type.slice(1);
-        showToast(`${typeLabel}: ${cases}c ${pieces}p of ${product.name} ${product.volume} replaced (from ${party})`, 'warning');
-        return true;
+        const ok = await recordTransaction({ type, productId, cases, pieces, notes: fullNote });
+        if (ok) {
+            const typeLabel = type.charAt(0).toUpperCase() + type.slice(1);
+            showToast(`${typeLabel}: ${cases}c ${pieces}p of ${product.name} ${product.volume} replaced (from ${party})`, 'warning');
+        }
+        return ok;
     }
 
-    function performRetailTakeout(productId, cases, pieces, notes) {
+    async function performRetailTakeout(productId, cases, pieces, notes) {
         const product = getProduct(productId);
-        const stock = getStock(productId);
-        const requestedPieces = (cases * product.piecesPerCase) + pieces;
-        const availablePieces = getTotalPieces(productId);
-
-        if (requestedPieces <= 0) {
-            showToast('Please enter a valid quantity', 'warning');
-            return false;
-        }
-
-        if (requestedPieces > availablePieces) {
-            showToast(`Insufficient stock! Available: ${stock.cases} cases, ${stock.pieces} pieces`, 'error');
-            return false;
-        }
-
-        // Deduct stock
-        let remaining = availablePieces - requestedPieces;
-        const newCases = Math.floor(remaining / product.piecesPerCase);
-        const newPieces = remaining % product.piecesPerCase;
-
-        state.stock[productId] = { cases: newCases, pieces: newPieces };
-
-        // Log transaction
-        state.dispatches.push({
-            id: generateId(),
-            productId,
-            cases,
-            pieces,
-            totalPieces: requestedPieces,
-            notes: notes || '',
-            timestamp: new Date().toISOString(),
-            type: 'retail-takeout',
-            user: currentUser ? currentUser.username : 'unknown'
-        });
-
-        saveState();
-        showToast(`Taken out ${cases}c ${pieces}p of ${product.name} ${product.volume} for retail`, 'success');
-        return true;
+        if (!validateQty(cases, pieces)) return false;
+        if ((cases * product.piecesPerCase + pieces) <= 0) { showToast('Please enter a valid quantity', 'warning'); return false; }
+        const ok = await recordTransaction({ type: 'retail-takeout', productId, cases, pieces, notes: notes || '' });
+        if (ok) showToast(`Taken out ${cases}c ${pieces}p of ${product.name} ${product.volume} for retail`, 'success');
+        return ok;
     }
 
-    function performRetailReturn(productId, cases, pieces, notes) {
+    async function performRetailReturn(productId, cases, pieces, notes) {
         const product = getProduct(productId);
-
-        if (cases <= 0 && pieces <= 0) {
-            showToast('Please enter a valid quantity', 'warning');
-            return false;
-        }
-
-        // Add stock back
-        const stock = getStock(productId);
-        let totalPieces = (stock.cases * product.piecesPerCase) + stock.pieces + (cases * product.piecesPerCase) + pieces;
-        const newCases = Math.floor(totalPieces / product.piecesPerCase);
-        const newPcs = totalPieces % product.piecesPerCase;
-
-        state.stock[productId] = { cases: newCases, pieces: newPcs };
-
-        // Log transaction
-        state.dispatches.push({
-            id: generateId(),
-            productId,
-            cases,
-            pieces,
-            totalPieces: (cases * product.piecesPerCase) + pieces,
-            notes: notes || '',
-            timestamp: new Date().toISOString(),
-            type: 'retail-return',
-            user: currentUser ? currentUser.username : 'unknown'
-        });
-
-        saveState();
-        showToast(`Returned ${cases}c ${pieces}p of ${product.name} ${product.volume} to inventory`, 'success');
-        return true;
+        if (!validateQty(cases, pieces)) return false;
+        if (cases <= 0 && pieces <= 0) { showToast('Please enter a valid quantity', 'warning'); return false; }
+        const ok = await recordTransaction({ type: 'retail-return', productId, cases, pieces, notes: notes || '' });
+        if (ok) showToast(`Returned ${cases}c ${pieces}p of ${product.name} ${product.volume} to inventory`, 'success');
+        return ok;
     }
 
     // ==========================================
@@ -1364,7 +1293,7 @@
                     const qtyParts = [];
                     if (d.cases > 0) qtyParts.push(`${d.cases}c`);
                     if (d.pieces > 0) qtyParts.push(`${d.pieces}p`);
-                    const userTag = d.user ? ` (${d.user})` : '';
+                    const userTag = d.user ? ` (${esc(d.user)})` : '';
                     return `<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.04);font-size:0.85rem;">
                         <span style="color:var(--text-muted)">${formatDate(d.timestamp)} ${formatTime(d.timestamp)}${userTag}</span>
                         <span style="font-weight:700;color:${color}">${prefix}${qtyParts.join(' ')}</span>
@@ -1585,6 +1514,26 @@
         showToast('Data exported successfully!', 'success');
     }
 
+    // Download a server-generated Excel (.xlsx) report.
+    // kind = inventory | history | retailing | leakage
+    async function downloadExcel(kind) {
+        try {
+            showToast('Preparing Excel file...', 'info');
+            const res = await apiFetch(`/api/export/${kind}.xlsx`);
+            if (!res.ok) { showToast('Failed to generate Excel', 'error'); return; }
+            const blob = await res.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `${kind}-${getToday()}.xlsx`;
+            a.click();
+            URL.revokeObjectURL(url);
+            showToast('Excel downloaded', 'success');
+        } catch (e) {
+            showToast('Server error. Please try again.', 'error');
+        }
+    }
+
     // ==========================================
     // RESET DATA (Admin Only)
     // ==========================================
@@ -1596,21 +1545,16 @@
         const confirmed = await showConfirm('Reset All Data?', 'This will reset all stock levels to initial values and clear all dispatch history. This action cannot be undone.');
         if (!confirmed) return;
 
-        localStorage.removeItem(STORAGE_KEY);
-        state = { stock: {}, dispatches: [], initialized: false };
-        // Re-initialize from defaults
-        state.stock = {};
-        PRODUCT_CATALOG.forEach(p => {
-            state.stock[p.id] = {
-                cases: p.initialStockCases,
-                pieces: p.initialStockPieces
-            };
-        });
-        state.dispatches = [];
-        state.initialized = true;
-        await saveState();
-        renderCurrentView();
-        showToast('All data has been reset', 'info');
+        try {
+            const res = await apiFetch('/api/reset', { method: 'POST' });
+            const data = await res.json();
+            if (!data.success) { showToast(data.error || 'Failed to reset', 'error'); return; }
+            await loadStateFromServer();
+            renderCurrentView();
+            showToast('All data has been reset', 'info');
+        } catch (e) {
+            showToast('Server error. Please try again.', 'error');
+        }
     }
 
     // ==========================================
@@ -1693,7 +1637,7 @@
 
         // Dispatch form
         document.getElementById('dispatch-product').addEventListener('change', handleDispatchProductChange);
-        document.getElementById('dispatch-form').addEventListener('submit', (e) => {
+        document.getElementById('dispatch-form').addEventListener('submit', async (e) => {
             e.preventDefault();
             const productId = document.getElementById('dispatch-product').value;
             const cases = parseInt(document.getElementById('dispatch-cases').value) || 0;
@@ -1702,7 +1646,7 @@
 
             if (!productId) { showToast('Please select a product', 'warning'); return; }
 
-            if (performDispatch(productId, cases, pieces, notes)) {
+            if (await performDispatch(productId, cases, pieces, notes)) {
                 document.getElementById('dispatch-cases').value = 0;
                 document.getElementById('dispatch-pieces').value = 0;
                 document.getElementById('dispatch-notes').value = '';
@@ -1714,7 +1658,7 @@
 
         // Restock form
         document.getElementById('restock-product').addEventListener('change', handleRestockProductChange);
-        document.getElementById('restock-form').addEventListener('submit', (e) => {
+        document.getElementById('restock-form').addEventListener('submit', async (e) => {
             e.preventDefault();
             const productId = document.getElementById('restock-product').value;
             const cases = parseInt(document.getElementById('restock-cases').value) || 0;
@@ -1723,7 +1667,7 @@
 
             if (!productId) { showToast('Please select a product', 'warning'); return; }
 
-            if (performRestock(productId, cases, pieces, notes)) {
+            if (await performRestock(productId, cases, pieces, notes)) {
                 document.getElementById('restock-cases').value = 0;
                 document.getElementById('restock-pieces').value = 0;
                 document.getElementById('restock-notes').value = '';
@@ -1753,7 +1697,7 @@
 
         // Leakage form
         document.getElementById('leakage-product').addEventListener('change', handleLeakageProductChange);
-        document.getElementById('leakage-form').addEventListener('submit', (e) => {
+        document.getElementById('leakage-form').addEventListener('submit', async (e) => {
             e.preventDefault();
             const productId = document.getElementById('leakage-product').value;
             const cases = parseInt(document.getElementById('leakage-cases').value) || 0;
@@ -1765,7 +1709,7 @@
             if (!productId) { showToast('Please select a product', 'warning'); return; }
             if (!party) { showToast('Please enter the party name', 'warning'); return; }
 
-            if (performLeakage(productId, cases, pieces, type, party, notes)) {
+            if (await performLeakage(productId, cases, pieces, type, party, notes)) {
                 document.getElementById('leakage-cases').value = 0;
                 document.getElementById('leakage-pieces').value = 0;
                 document.getElementById('leakage-party').value = '';
@@ -1778,7 +1722,7 @@
 
         // Retail Takeout form
         document.getElementById('retail-takeout-product').addEventListener('change', handleRetailTakeoutProductChange);
-        document.getElementById('retail-takeout-form').addEventListener('submit', (e) => {
+        document.getElementById('retail-takeout-form').addEventListener('submit', async (e) => {
             e.preventDefault();
             const productId = document.getElementById('retail-takeout-product').value;
             const cases = parseInt(document.getElementById('retail-takeout-cases').value) || 0;
@@ -1787,7 +1731,7 @@
 
             if (!productId) { showToast('Please select a product', 'warning'); return; }
 
-            if (performRetailTakeout(productId, cases, pieces, notes)) {
+            if (await performRetailTakeout(productId, cases, pieces, notes)) {
                 document.getElementById('retail-takeout-cases').value = 0;
                 document.getElementById('retail-takeout-pieces').value = 0;
                 document.getElementById('retail-takeout-notes').value = '';
@@ -1800,7 +1744,7 @@
 
         // Retail Return form
         document.getElementById('retail-return-product').addEventListener('change', handleRetailReturnProductChange);
-        document.getElementById('retail-return-form').addEventListener('submit', (e) => {
+        document.getElementById('retail-return-form').addEventListener('submit', async (e) => {
             e.preventDefault();
             const productId = document.getElementById('retail-return-product').value;
             const cases = parseInt(document.getElementById('retail-return-cases').value) || 0;
@@ -1809,7 +1753,7 @@
 
             if (!productId) { showToast('Please select a product', 'warning'); return; }
 
-            if (performRetailReturn(productId, cases, pieces, notes)) {
+            if (await performRetailReturn(productId, cases, pieces, notes)) {
                 document.getElementById('retail-return-cases').value = 0;
                 document.getElementById('retail-return-pieces').value = 0;
                 document.getElementById('retail-return-notes').value = '';
@@ -1869,10 +1813,20 @@
 
         bindEvents();
 
-        // Check for existing session
+        // Check for existing session (need both the user and a valid token)
         const savedUser = getSessionUser();
-        if (savedUser) {
+        const savedToken = getSessionToken();
+        if (savedUser && savedToken) {
             currentUser = savedUser;
+            authToken = savedToken;
+            // Verify the token is still valid before showing the app
+            try {
+                const res = await apiFetch('/api/me');
+                if (!res.ok) throw new Error('invalid');
+            } catch (e) {
+                logout();
+                return;
+            }
             hideLoginScreen();
             updateUIForUser();
             await initializeState();
@@ -1892,7 +1846,9 @@
         quickRestock,
         quickLeakage,
         openChangePwDialog,
-        removeUser
+        removeUser,
+        undoTransaction,
+        downloadExcel
     };
 
     // Boot

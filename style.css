@@ -2605,3 +2605,44 @@ input, select, textarea { font-family: inherit; }
     border-color: var(--bg-glass-border);
     transform: none;
 }
+
+/* ============================================
+   ADDED: Excel buttons, Undo buttons, spinner
+   ============================================ */
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+.btn-excel {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: rgba(33, 160, 90, 0.14);
+    border: 1px solid rgba(33, 160, 90, 0.4);
+    color: #34d27b;
+}
+.btn-excel:hover {
+    background: rgba(33, 160, 90, 0.24);
+    color: #4ae08c;
+}
+.btn-excel svg { width: 15px; height: 15px; }
+
+.btn-undo-txn {
+    flex-shrink: 0;
+    width: 30px;
+    height: 30px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin-left: 10px;
+    border-radius: 8px;
+    background: transparent;
+    border: 1px solid var(--bg-glass-border);
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+.btn-undo-txn:hover {
+    background: rgba(229, 72, 77, 0.14);
+    border-color: rgba(229, 72, 77, 0.5);
+    color: #ff6b6e;
+}
+.btn-undo-txn svg { width: 15px; height: 15px; }
