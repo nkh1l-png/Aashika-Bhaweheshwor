@@ -140,6 +140,9 @@
         const adminNav = document.getElementById('nav-admin');
         adminNav.style.display = isAdmin() ? 'flex' : 'none';
 
+        // Full data export is admin-only.
+        document.getElementById('btn-export-data').style.display = isAdmin() ? 'flex' : 'none';
+
         // Show logout button
         document.getElementById('btn-logout').style.display = 'flex';
     }
@@ -182,8 +185,17 @@
 
     function getBrands() {
         const brands = new Set();
-        PRODUCT_CATALOG.forEach(p => brands.add(p.name));
+        PRODUCT_CATALOG.forEach(p => brands.add(getBrandName(p)));
         return Array.from(brands).sort();
+    }
+
+    function getBrandName(product) {
+        const knownBrands = [
+            'Badam Juice', 'Himalayan Dragon', 'Rara Blues', 'Red Bull',
+            'Seoul Soju', 'Seto Bagh'
+        ];
+        const name = String(product.name || '').trim();
+        return knownBrands.find(brand => name === brand || name.startsWith(brand + ' ')) || name.split(/\s+/)[0] || name;
     }
 
     function formatDate(dateStr) {
@@ -368,7 +380,7 @@
 
         // Brand filter
         if (options.brand && options.brand !== 'all') {
-            filtered = filtered.filter(p => p.name === options.brand);
+            filtered = filtered.filter(p => getBrandName(p) === options.brand);
         }
 
         // Status filter
@@ -467,8 +479,8 @@
                     <div class="product-card-image">
                         <img src="${encodeURIComponent(p.image)}" alt="${p.name} ${p.volume}" loading="lazy">
                     </div>
-                    <div class="product-card-name" title="${p.name}">${p.name}</div>
-                    <div class="product-card-volume">${p.volume} · ${p.piecesPerCase} pcs/case</div>
+                    <div class="product-card-name" title="${p.name} ${p.volume}">${p.name} ${p.volume}</div>
+                    <div class="product-card-volume">${p.piecesPerCase} pcs/case</div>
                     <div class="product-card-stock">
                         <span class="stock-count">${s.cases}c ${s.pieces}p</span>
                         <span class="stock-badge ${badgeClass}">${getStatusLabel(stockStatus)}</span>
@@ -500,21 +512,21 @@
             const badgeClass = `badge-${status}`;
             return `
                 <tr>
-                    <td>
+                    <td data-label="Product">
                         <div class="table-product">
                             <div class="table-product-img">
                                 <img src="${encodeURIComponent(p.image)}" alt="${p.name}" loading="lazy">
                             </div>
-                            <span class="table-product-name">${p.name}</span>
+                            <span class="table-product-name">${p.name} ${p.volume}</span>
                         </div>
                     </td>
-                    <td>${p.volume}</td>
-                    <td>${p.piecesPerCase}</td>
-                    <td><strong>${s.cases}</strong></td>
-                    <td>${s.pieces}</td>
-                    <td>${total}</td>
-                    <td><span class="stock-badge ${badgeClass}">${getStatusLabel(status)}</span></td>
-                    <td>
+                    <td data-label="Volume">${p.volume}</td>
+                    <td data-label="Pcs/Case">${p.piecesPerCase}</td>
+                    <td data-label="Cases"><strong>${s.cases}</strong></td>
+                    <td data-label="Loose Pcs">${s.pieces}</td>
+                    <td data-label="Total Pcs">${total}</td>
+                    <td data-label="Status"><span class="stock-badge ${badgeClass}">${getStatusLabel(status)}</span></td>
+                    <td data-label="Actions">
                         <div class="table-actions">
                             <button class="btn-table btn-table-dispatch" onclick="window.app.quickDispatch('${p.id}')">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
@@ -1493,6 +1505,11 @@
     // EXPORT DATA
     // ==========================================
     function exportData() {
+        if (!isAdmin()) {
+            showToast('Only administrators can export all data', 'error');
+            return;
+        }
+
         const data = {
             exportedAt: new Date().toISOString(),
             products: PRODUCT_CATALOG.map(p => ({
@@ -1593,7 +1610,7 @@
                 updateUIForUser();
                 await initializeState();
                 populateBrandFilters();
-                renderDashboard();
+                switchView('dashboard');
             } else {
                 errorEl.textContent = result.error;
                 errorEl.style.display = 'block';
@@ -1831,7 +1848,7 @@
             updateUIForUser();
             await initializeState();
             populateBrandFilters();
-            renderDashboard();
+            switchView('dashboard');
         } else {
             // Show login screen
             showLoginScreen();

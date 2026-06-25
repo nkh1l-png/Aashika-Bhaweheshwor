@@ -48,6 +48,7 @@ const DEFAULT_USERS = [
 const DEDUCT_TYPES = ['dispatch', 'leakage', 'breakage', 'retail-takeout'];
 const ADD_TYPES = ['restock', 'retail-return'];
 const ALL_TYPES = [...DEDUCT_TYPES, ...ADD_TYPES];
+const ADMIN_TRANSACTION_TYPES = ['restock', 'leakage', 'breakage', 'retail-takeout', 'retail-return'];
 
 // ============================================================
 // PASSWORD HASHING  (Node built-in crypto — no extra dependency)
@@ -102,6 +103,19 @@ function verifyToken(token) {
 // ============================================================
 let mongoCol = null;
 let memoryDb = null; // authoritative in-memory copy
+
+function addAudit(auth, action, details = {}) {
+    if (!memoryDb.auditLog) memoryDb.auditLog = [];
+    memoryDb.auditLog.push({
+        id: 'audit_' + Date.now() + '_' + crypto.randomBytes(3).toString('hex'),
+        action,
+        user: auth && auth.u ? auth.u : 'system',
+        role: auth && auth.r ? auth.r : '',
+        timestamp: new Date().toISOString(),
+        ...details,
+    });
+    if (memoryDb.auditLog.length > 1000) memoryDb.auditLog = memoryDb.auditLog.slice(-1000);
+}
 
 async function connectMongo() {
     const { MongoClient } = require('mongodb');
@@ -169,13 +183,14 @@ async function bootstrap() {
     let dirty = false;
 
     if (!db) {
-        db = { users: [], stock: {}, dispatches: [], initialized: false, settings: {} };
+        db = { users: [], stock: {}, dispatches: [], auditLog: [], initialized: false, settings: {} };
         dirty = true;
     }
     db.settings = db.settings || {};
     db.users = db.users || [];
     db.stock = db.stock || {};
     db.dispatches = db.dispatches || [];
+    db.auditLog = db.auditLog || [];
 
     // Session secret: env wins; otherwise generate once and persist
     if (SESSION_SECRET) {
@@ -350,6 +365,7 @@ const server = http.createServer(async (req, res) => {
             if (memoryDb.users.some(u => u.username === uname)) return sendJson(res, 409, { success: false, error: 'Username already exists' });
             await withLock(async () => {
                 memoryDb.users.push({ username: uname, password: hashPassword(password), displayName: String(displayName).trim(), role: role === 'admin' ? 'admin' : 'staff' });
+                addAudit(auth, 'user-added', { targetUser: uname, notes: `Added ${role === 'admin' ? 'admin' : 'staff'} user` });
                 await persist();
             });
             return sendJson(res, 200, { success: true });
@@ -365,6 +381,7 @@ const server = http.createServer(async (req, res) => {
                 return sendJson(res, 400, { success: false, error: 'Cannot remove the last admin user' });
             await withLock(async () => {
                 memoryDb.users = memoryDb.users.filter(u => u.username !== username);
+                addAudit(auth, 'user-removed', { targetUser: username, notes: `Removed ${target.role} user` });
                 await persist();
             });
             return sendJson(res, 200, { success: true });
@@ -372,19 +389,27 @@ const server = http.createServer(async (req, res) => {
 
         if (pathname === '/api/users/change-password' && req.method === 'POST') {
             const { username, newPassword } = await parseBody(req);
-            // Admin can change anyone; a user may change their own
-            if (auth.r !== 'admin' && username !== auth.u) return sendJson(res, 403, { success: false, error: 'Not allowed' });
+            if (auth.r !== 'admin') return sendJson(res, 403, { success: false, error: 'Admin only' });
             if (!username || !newPassword) return sendJson(res, 400, { success: false, error: 'Username and new password are required' });
             if (String(newPassword).length < 4) return sendJson(res, 400, { success: false, error: 'Password must be at least 4 characters' });
             const user = memoryDb.users.find(u => u.username === username);
             if (!user) return sendJson(res, 404, { success: false, error: 'User not found' });
-            await withLock(async () => { user.password = hashPassword(newPassword); await persist(); });
+            await withLock(async () => {
+                user.password = hashPassword(newPassword);
+                addAudit(auth, 'password-changed', { targetUser: username, notes: 'Password changed by admin' });
+                await persist();
+            });
             return sendJson(res, 200, { success: true });
         }
 
         // ---------- STATE (stock + transactions) ----------
         if (pathname === '/api/state' && req.method === 'GET') {
-            return sendJson(res, 200, { stock: memoryDb.stock, dispatches: memoryDb.dispatches, initialized: true });
+            return sendJson(res, 200, {
+                stock: memoryDb.stock,
+                dispatches: memoryDb.dispatches,
+                auditLog: auth.r === 'admin' ? memoryDb.auditLog : [],
+                initialized: true
+            });
         }
 
         // ---------- ADD TRANSACTION (server computes stock) ----------
@@ -396,6 +421,9 @@ const server = http.createServer(async (req, res) => {
             const type = body.type;
             if (!product) return sendJson(res, 400, { success: false, error: 'Unknown product' });
             if (!ALL_TYPES.includes(type)) return sendJson(res, 400, { success: false, error: 'Invalid transaction type' });
+            if (auth.r !== 'admin' && ADMIN_TRANSACTION_TYPES.includes(type)) {
+                return sendJson(res, 403, { success: false, error: 'Admin only' });
+            }
             if (cases < 0 || pieces < 0) return sendJson(res, 400, { success: false, error: 'Quantities cannot be negative' });
             const requested = cases * product.piecesPerCase + pieces;
             if (requested <= 0) return sendJson(res, 400, { success: false, error: 'Please enter a valid quantity' });
@@ -428,8 +456,10 @@ const server = http.createServer(async (req, res) => {
                 if (idx < 0) return { error: 'Transaction not found' };
                 const txn = memoryDb.dispatches[idx];
                 if (auth.r !== 'admin' && txn.user !== auth.u) return { error: 'You can only undo your own transactions' };
+                if (auth.r !== 'admin' && txn.type !== 'dispatch') return { error: 'Only admins can undo this transaction type' };
                 applyEffect(txn, -1); // reverse its stock effect
                 memoryDb.dispatches.splice(idx, 1);
+                addAudit(auth, 'transaction-undone', { targetId: txn.id, notes: `${txn.type} transaction undone` });
                 await persist();
                 return { stock: memoryDb.stock };
             });
@@ -444,6 +474,7 @@ const server = http.createServer(async (req, res) => {
                 memoryDb.stock = {};
                 PRODUCT_CATALOG.forEach(p => { memoryDb.stock[p.id] = { cases: p.initialStockCases, pieces: p.initialStockPieces }; });
                 memoryDb.dispatches = [];
+                addAudit(auth, 'data-reset', { notes: 'Reset stock to initial values and cleared transaction history' });
                 await persist();
             });
             return sendJson(res, 200, { success: true });
@@ -452,6 +483,11 @@ const server = http.createServer(async (req, res) => {
         // ---------- EXCEL EXPORT ----------
         const exp = pathname.match(/^\/api\/export\/(inventory|history|retailing|leakage)\.xlsx$/);
         if (exp && req.method === 'GET') {
+            if (auth.r !== 'admin') return sendJson(res, 403, { success: false, error: 'Admin only' });
+            await withLock(async () => {
+                addAudit(auth, 'excel-exported', { notes: `Exported ${exp[1]} report` });
+                await persist();
+            });
             const buf = buildWorkbook(exp[1]);
             res.writeHead(200, {
                 'Content-Type': MIME_TYPES['.xlsx'],
