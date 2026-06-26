@@ -1554,6 +1554,32 @@
         }
     }
 
+    async function downloadPeriodicExcel(range, dateVal, monthVal) {
+        try {
+            showToast('Preparing periodic Excel report...', 'info');
+            let query = `?range=${range}`;
+            if (dateVal) query += `&date=${dateVal}`;
+            if (monthVal) query += `&month=${monthVal}`;
+
+            const res = await apiFetch(`/api/export/periodic-report.xlsx${query}`);
+            if (!res.ok) {
+                const data = await res.json();
+                throw new Error(data.error || 'Failed to generate Excel');
+            }
+            const blob = await res.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            const suffix = range === 'monthly' ? monthVal : dateVal;
+            a.download = `periodic-report-${range}-${suffix}.xlsx`;
+            a.click();
+            URL.revokeObjectURL(url);
+            showToast('Excel report downloaded successfully!', 'success');
+        } catch (e) {
+            showToast(e.message || 'Server error. Please try again.', 'error');
+        }
+    }
+
     // ==========================================
     // RESET DATA (Admin Only)
     // ==========================================
@@ -1908,6 +1934,44 @@
 
             reader.readAsDataURL(file);
         });
+
+        // Report range toggle
+        const reportRangeSelect = document.getElementById('report-range');
+        if (reportRangeSelect) {
+            reportRangeSelect.addEventListener('change', (e) => {
+                const range = e.target.value;
+                const dateContainer = document.getElementById('report-date-container');
+                const monthContainer = document.getElementById('report-month-container');
+                if (range === 'monthly') {
+                    dateContainer.style.display = 'none';
+                    monthContainer.style.display = 'block';
+                } else {
+                    dateContainer.style.display = 'block';
+                    monthContainer.style.display = 'none';
+                }
+            });
+        }
+
+        // Report download submission
+        const downloadReportBtn = document.getElementById('admin-btn-download-report');
+        if (downloadReportBtn) {
+            downloadReportBtn.addEventListener('click', async () => {
+                const range = document.getElementById('report-range').value;
+                const dateVal = document.getElementById('report-date').value;
+                const monthVal = document.getElementById('report-month').value;
+
+                if ((range === 'daily' || range === 'weekly') && !dateVal) {
+                    showToast('Please select a date first', 'warning');
+                    return;
+                }
+                if (range === 'monthly' && !monthVal) {
+                    showToast('Please select a month first', 'warning');
+                    return;
+                }
+
+                await downloadPeriodicExcel(range, dateVal, monthVal);
+            });
+        }
     }
 
     // ==========================================
@@ -1916,6 +1980,16 @@
     async function init() {
         // Set date in header
         document.getElementById('header-date').textContent = formatDate(new Date().toISOString());
+
+        // Initialize Periodic Report date pickers
+        const reportDateInput = document.getElementById('report-date');
+        const reportMonthInput = document.getElementById('report-month');
+        if (reportDateInput) {
+            reportDateInput.value = getToday();
+        }
+        if (reportMonthInput) {
+            reportMonthInput.value = getToday().substring(0, 7);
+        }
 
         bindEvents();
 

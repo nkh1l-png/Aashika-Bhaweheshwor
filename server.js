@@ -365,6 +365,171 @@ function fmtQty(d) {
     if (d.pieces > 0) parts.push(`${d.pieces}p`);
     return parts.join(' ') || '0';
 }
+function getBrandName(product) {
+    const knownBrands = [
+        'Badam Juice', 'Himalayan Dragon', 'Rara Blues', 'Red Bull',
+        'Seoul Soju', 'Seto Bagh'
+    ];
+    const name = String(product.name || '').trim();
+    return knownBrands.find(brand => name === brand || name.startsWith(brand + ' ')) || name.split(/\s+/)[0] || name;
+}
+
+function buildPeriodicReport(type, dateVal, monthVal) {
+    const wb = XLSX.utils.book_new();
+
+    let startStr = '';
+    let endStr = '';
+    let periodStr = '';
+
+    if (type === 'daily') {
+        const targetDate = dateVal || new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Kathmandu' }).split(' ')[0];
+        startStr = targetDate;
+        endStr = targetDate;
+        periodStr = new Date(targetDate).toLocaleDateString('en-US', { timeZone: 'Asia/Kathmandu', weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' });
+    } else if (type === 'weekly') {
+        const targetDate = dateVal || new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Kathmandu' }).split(' ')[0];
+        const endDate = new Date(targetDate);
+        const startDate = new Date(targetDate);
+        startDate.setDate(startDate.getDate() - 6);
+
+        startStr = startDate.toLocaleString('sv-SE', { timeZone: 'Asia/Kathmandu' }).split(' ')[0];
+        endStr = endDate.toLocaleString('sv-SE', { timeZone: 'Asia/Kathmandu' }).split(' ')[0];
+
+        const formatOptions = { timeZone: 'Asia/Kathmandu', year: 'numeric', month: 'short', day: 'numeric' };
+        periodStr = `${startDate.toLocaleDateString('en-US', formatOptions)} to ${endDate.toLocaleDateString('en-US', formatOptions)}`;
+    } else if (type === 'monthly') {
+        const targetMonth = monthVal || new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Kathmandu' }).substring(0, 7);
+        startStr = `${targetMonth}-01`;
+        const parts = targetMonth.split('-');
+        const y = parseInt(parts[0]);
+        const m = parseInt(parts[1]);
+        const lastDay = new Date(y, m, 0).getDate();
+        endStr = `${targetMonth}-${String(lastDay).padStart(2, '0')}`;
+
+        const dateObj = new Date(y, m - 1, 1);
+        periodStr = dateObj.toLocaleDateString('en-US', { timeZone: 'Asia/Kathmandu', year: 'numeric', month: 'long' });
+    }
+
+    const list = memoryDb.dispatches.filter(d => {
+        const localDate = new Date(d.timestamp).toLocaleString('sv-SE', { timeZone: 'Asia/Kathmandu' }).split(' ')[0];
+        return localDate >= startStr && localDate <= endStr;
+    }).slice().sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+    const summaryRows = [];
+    summaryRows.push(["AASHIKA BHAWEHESHWOR STOCK MANAGER"]);
+    summaryRows.push([`${type.toUpperCase()} TRANSACTION REPORT`]);
+    summaryRows.push([`Period: ${periodStr}`]);
+    summaryRows.push([]);
+    summaryRows.push(["TRANSACTION TYPE SUMMARY"]);
+    summaryRows.push(["Transaction Type", "Cases", "Pieces", "Total Equivalent Pcs"]);
+
+    const getSums = (types) => {
+        let cases = 0;
+        let pieces = 0;
+        let total = 0;
+        list.forEach(d => {
+            if (types.includes(d.type)) {
+                cases += d.cases || 0;
+                pieces += d.pieces || 0;
+                total += d.totalPieces || 0;
+            }
+        });
+        return { cases, pieces, total };
+    };
+
+    const dispSums = getSums(['dispatch']);
+    const restockSums = getSums(['restock']);
+    const retailOutSums = getSums(['retail-takeout']);
+    const retailInSums = getSums(['retail-return']);
+    const leakSums = getSums(['leakage', 'breakage']);
+
+    summaryRows.push(["Dispatches (Sales)", dispSums.cases, dispSums.pieces, dispSums.total]);
+    summaryRows.push(["Restocks (Inventory Add)", restockSums.cases, restockSums.pieces, restockSums.total]);
+    summaryRows.push(["Daily Retailing Takeout", retailOutSums.cases, retailOutSums.pieces, retailOutSums.total]);
+    summaryRows.push(["Daily Retailing Returns", retailInSums.cases, retailInSums.pieces, retailInSums.total]);
+    summaryRows.push(["Leakage / Breakage Loss", leakSums.cases, leakSums.pieces, leakSums.total]);
+
+    summaryRows.push([]);
+    summaryRows.push(["BRAND-WISE DISPATCH PERFORMANCE (SALES)"]);
+    summaryRows.push(["Brand Name", "Total Cases Sold", "Total Pieces Sold", "Total Equivalent Pcs"]);
+
+    const brandData = {};
+    list.forEach(d => {
+        if (d.type === 'dispatch' || d.type === 'retail-takeout') {
+            const product = getProduct(d.productId);
+            if (product) {
+                const brand = getBrandName(product);
+                if (!brandData[brand]) {
+                    brandData[brand] = { cases: 0, pieces: 0, total: 0 };
+                }
+                brandData[brand].cases += d.cases || 0;
+                brandData[brand].pieces += d.pieces || 0;
+                brandData[brand].total += d.totalPieces || 0;
+            }
+        }
+    });
+
+    const sortedBrands = Object.entries(brandData).sort((a, b) => b[1].total - a[1].total);
+    if (sortedBrands.length === 0) {
+        summaryRows.push(["No sales transactions in this period", "-", "-", "-"]);
+    } else {
+        sortedBrands.forEach(([brand, data]) => {
+            summaryRows.push([brand, data.cases, data.pieces, data.total]);
+        });
+    }
+
+    const wsSummary = XLSX.utils.aoa_to_sheet(summaryRows);
+    const maxCols = summaryRows.reduce((max, r) => Math.max(max, r.length), 0);
+    wsSummary['!cols'] = Array(maxCols).fill({ wch: 24 });
+    wsSummary['!cols'][0] = { wch: 32 };
+
+    XLSX.utils.book_append_sheet(wb, wsSummary, 'Summary Dashboard');
+
+    const ledgerRows = list.map(d => {
+        const p = getProduct(d.productId) || { name: d.productId, volume: '' };
+        return {
+            "Date & Time": new Date(d.timestamp).toLocaleString('en-US', { timeZone: 'Asia/Kathmandu' }),
+            "Type": d.type,
+            "Product": p.name,
+            "Volume": p.volume,
+            "Cases": d.cases,
+            "Pieces": d.pieces,
+            "Total Pcs": d.totalPieces,
+            "Operator": d.user || '',
+            "Notes": d.notes || ''
+        };
+    });
+
+    const wsLedger = XLSX.utils.json_to_sheet(ledgerRows);
+    wsLedger['!cols'] = [
+        { wch: 22 }, { wch: 15 }, { wch: 25 }, { wch: 10 },
+        { wch: 8 }, { wch: 8 }, { wch: 12 }, { wch: 12 }, { wch: 25 }
+    ];
+    XLSX.utils.book_append_sheet(wb, wsLedger, 'Transaction Ledger');
+
+    const invRows = PRODUCT_CATALOG.map(p => {
+        const s = memoryDb.stock[p.id] || { cases: 0, pieces: 0 };
+        const total = totalPieces(s, p);
+        return {
+            "Product": p.name,
+            "Volume": p.volume,
+            "Pcs/Case": p.piecesPerCase,
+            "Cases": s.cases,
+            "Loose Pcs": s.pieces,
+            "Total Equivalent Pcs": total,
+            "Status": total === 0 ? 'Out of Stock' : (s.cases < 3 && total < p.piecesPerCase * 3 ? 'Low Stock' : 'In Stock')
+        };
+    });
+
+    const wsInv = XLSX.utils.json_to_sheet(invRows);
+    wsInv['!cols'] = [
+        { wch: 25 }, { wch: 10 }, { wch: 10 }, { wch: 8 }, { wch: 10 }, { wch: 20 }, { wch: 15 }
+    ];
+    XLSX.utils.book_append_sheet(wb, wsInv, 'Inventory Status');
+
+    return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+}
+
 function buildWorkbook(kind) {
     const wb = XLSX.utils.book_new();
     if (kind === 'inventory') {
@@ -624,6 +789,27 @@ const server = http.createServer(async (req, res) => {
             res.writeHead(200, {
                 'Content-Type': MIME_TYPES['.xlsx'],
                 'Content-Disposition': `attachment; filename="${exp[1]}-${new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Kathmandu' })}.xlsx"`,
+            });
+            return res.end(buf);
+        }
+
+        // ---------- EXCEL PERIODIC REPORT ----------
+        if (pathname === '/api/export/periodic-report.xlsx' && req.method === 'GET') {
+            if (auth.r !== 'admin') return sendJson(res, 403, { success: false, error: 'Admin only' });
+            const range = url.searchParams.get('range') || 'daily';
+            const dateVal = url.searchParams.get('date');
+            const monthVal = url.searchParams.get('month');
+
+            await withLock(async () => {
+                addAudit(auth, 'excel-exported', { notes: `Exported periodic report (${range})` });
+                await persist();
+            });
+
+            const buf = buildPeriodicReport(range, dateVal, monthVal);
+            const nameSuffix = range === 'monthly' ? (monthVal || 'month') : (dateVal || 'day');
+            res.writeHead(200, {
+                'Content-Type': MIME_TYPES['.xlsx'],
+                'Content-Disposition': `attachment; filename="periodic-report-${range}-${nameSuffix}.xlsx"`,
             });
             return res.end(buf);
         }
